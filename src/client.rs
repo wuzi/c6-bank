@@ -116,6 +116,7 @@ impl ClientBuilder {
             Some(http) => http,
             None => {
                 let mut builder = reqwest::Client::builder()
+                    .tls_backend_rustls()
                     .identity(self.identity.ok_or(Error::Configuration)?)
                     .redirect(reqwest::redirect::Policy::none())
                     .retry(reqwest::retry::never())

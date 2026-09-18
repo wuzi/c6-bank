@@ -282,3 +282,16 @@ fn response_preserves_unknown_fields_and_optional_receipt_metadata() {
         .is_err()
     );
 }
+
+#[test]
+fn oauth_not_found_is_not_authoritative_resource_absence() {
+    let error = c6_bank::Error::Authentication { status: Some(404) };
+    assert!(!error.is_not_found());
+    assert!(
+        c6_bank::Error::Http {
+            status: 404,
+            indeterminate: false
+        }
+        .is_not_found()
+    );
+}

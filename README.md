@@ -85,6 +85,7 @@ Before production, validate a due-charge lifecycle against C6 sandbox with your 
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test --features reqwest/native-tls # verify dependency feature unification
 cargo package
 ```
 

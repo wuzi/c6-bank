@@ -33,7 +33,7 @@ impl Error {
         }
     }
     pub fn is_not_found(&self) -> bool {
-        self.status() == Some(404)
+        matches!(self, Self::Http { status: 404, .. })
     }
 }
 impl fmt::Display for Error {
