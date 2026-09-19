@@ -53,7 +53,7 @@ Supply CNPJ instead of CPF for a legal entity. C6's inline PUT example lists CPF
 
 `Environment::Production` explicitly selects production. `base_url`, `auth_url`, `timeout`, `add_root_certificate_pem` and `http_client` support controlled environments and testing. The default transport requires a PEM certificate chain and unencrypted PEM private key, checks server certificates, disables redirects and automatic retries, and has a 30-second timeout. An injected HTTP client replaces these transport settings: the caller must configure its mTLS identity, timeout, redirect policy and retry policy. Never use insecure certificate validation in production.
 
-Errors deliberately omit server bodies, URLs, credentials and raw transport details. `status()` exposes the HTTP status, and `is_not_found()` identifies 404. `is_indeterminate()` flags mutation transport errors, HTTP 408/5xx and invalid success responses. Reconcile through GET using the original transaction ID. A 401 clears the shared token for the next explicit request without replaying the failed operation. Authentication failures occur before the mutation is sent.
+Errors deliberately omit server bodies, URLs, credentials and raw transport details. `status()` exposes the HTTP status, `retry_after()` retains the native `Retry-After` value, and `is_not_found()` identifies 404. `is_indeterminate()` flags mutation transport errors, HTTP 408/5xx and invalid success responses. Reconcile through GET using the original transaction ID. A 401 clears the shared token for the next explicit request without replaying the failed operation. Authentication failures occur before the mutation is sent.
 
 ## Operations
 

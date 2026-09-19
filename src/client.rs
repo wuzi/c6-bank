@@ -168,6 +168,15 @@ fn endpoint(base: &Url, parts: &[&str]) -> Result<Url, Error> {
     }
     Ok(url)
 }
+
+fn retry_after(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
 impl Client {
     pub fn builder(
         client_id: impl Into<String>,
@@ -200,24 +209,35 @@ impl Client {
             ])
             .send()
             .await
-            .map_err(|_| Error::Authentication { status: None })?;
+            .map_err(|_| Error::Authentication {
+                status: None,
+                retry_after: None,
+            })?;
         if !response.status().is_success() {
             return Err(Error::Authentication {
                 status: Some(response.status().as_u16()),
+                retry_after: retry_after(&response),
             });
         }
-        let response: Response = response
-            .json()
-            .await
-            .map_err(|_| Error::Authentication { status: None })?;
+        let response: Response = response.json().await.map_err(|_| Error::Authentication {
+            status: None,
+            retry_after: None,
+        })?;
         if response.access_token.is_empty() {
-            return Err(Error::Authentication { status: None });
+            return Err(Error::Authentication {
+                status: None,
+                retry_after: None,
+            });
         }
         let ttl = Duration::from_secs(response.expires_in);
         let margin = (ttl / 10).min(Duration::from_secs(30));
-        let expires_at = started
-            .checked_add(ttl.saturating_sub(margin))
-            .ok_or(Error::Authentication { status: None })?;
+        let expires_at =
+            started
+                .checked_add(ttl.saturating_sub(margin))
+                .ok_or(Error::Authentication {
+                    status: None,
+                    retry_after: None,
+                })?;
         let value = response.access_token;
         *cache = Some(Token {
             value: value.clone(),
@@ -263,6 +283,7 @@ impl Client {
         if !status.is_success() {
             return Err(Error::Http {
                 status: status.as_u16(),
+                retry_after: retry_after(&response),
                 indeterminate: mutation && (status.is_server_error() || status.as_u16() == 408),
             });
         }

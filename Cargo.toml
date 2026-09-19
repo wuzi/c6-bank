@@ -1,6 +1,6 @@
 [package]
 name = "c6-bank"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Async C6 Bank Pix SDK with mutual TLS and shared OAuth authentication"

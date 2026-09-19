@@ -16,6 +16,7 @@ struct Bank {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     auths: Arc<Mutex<usize>>,
     fail: Arc<Mutex<Option<u16>>>,
+    retry_after: Arc<Mutex<Option<String>>>,
     auth_fail: Arc<Mutex<bool>>,
     malformed: Arc<Mutex<bool>>,
     delay: Arc<Mutex<bool>>,
@@ -60,8 +61,11 @@ async fn handler(State(bank): State<Bank>, req: Request) -> Response {
         return Response::new(Body::from("{malformed secret}"));
     }
     if let Some(status) = *bank.fail.lock().unwrap() {
-        return Response::builder()
-            .status(status)
+        let mut response = Response::builder().status(status);
+        if let Some(retry_after) = bank.retry_after.lock().unwrap().as_deref() {
+            response = response.header("Retry-After", retry_after);
+        }
+        return response
             .body(Body::from("secret-bank-error private-identity"))
             .unwrap();
     }
@@ -204,6 +208,21 @@ async fn classifies_uncertain_mutations_without_replay_or_sensitive_errors() {
     assert!(error.is_not_found());
     assert!(!error.is_indeterminate());
 }
+
+#[tokio::test]
+async fn rate_limited_patch_exposes_retry_after_without_replaying() {
+    let (client, bank) = setup().await;
+    *bank.fail.lock().unwrap() = Some(429);
+    *bank.retry_after.lock().unwrap() = Some("Wed, 21 Oct 2015 07:28:00 GMT".into());
+
+    let error = client.cancel_due_charge(TXID).await.unwrap_err();
+
+    assert_eq!(error.status(), Some(429));
+    assert_eq!(error.retry_after(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+    assert!(!error.is_indeterminate());
+    assert_eq!(bank.requests.lock().unwrap().len(), 2);
+    assert!(!format!("{error:?} {error}").contains("secret"));
+}
 #[test]
 fn accepts_minimal_charge_but_requires_authoritative_identity() {
     let charge: DueCharge =
@@ -285,11 +304,15 @@ fn response_preserves_unknown_fields_and_optional_receipt_metadata() {
 
 #[test]
 fn oauth_not_found_is_not_authoritative_resource_absence() {
-    let error = c6_bank::Error::Authentication { status: Some(404) };
+    let error = c6_bank::Error::Authentication {
+        status: Some(404),
+        retry_after: None,
+    };
     assert!(!error.is_not_found());
     assert!(
         c6_bank::Error::Http {
             status: 404,
+            retry_after: None,
             indeterminate: false
         }
         .is_not_found()
