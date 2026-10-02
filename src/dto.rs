@@ -88,6 +88,8 @@ pub struct Pix {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Receipt query bounds are RFC3339 timestamps. [`crate::Client::list_pix`]
+/// converts them to UTC and truncates fractional seconds for C6's query format.
 pub struct PixQuery {
     pub inicio: String,
     pub fim: String,
@@ -97,6 +99,26 @@ pub struct PixQuery {
     pub pagina_atual: u32,
     #[serde(rename = "paginacao.itensPorPagina")]
     pub itens_por_pagina: u32,
+}
+impl PixQuery {
+    pub(crate) fn normalized(&self) -> Result<Self, crate::Error> {
+        let start = chrono::DateTime::parse_from_rfc3339(&self.inicio)
+            .map_err(|_| crate::Error::Configuration)?;
+        let end = chrono::DateTime::parse_from_rfc3339(&self.fim)
+            .map_err(|_| crate::Error::Configuration)?;
+        if start > end {
+            return Err(crate::Error::Configuration);
+        }
+        Ok(Self {
+            inicio: start
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            fim: end
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ..self.clone()
+        })
+    }
 }
 impl Default for PixQuery {
     fn default() -> Self {
@@ -127,7 +149,10 @@ pub struct Pagination {
     pub pagina_atual: u32,
     pub itens_por_pagina: u32,
     pub quantidade_de_paginas: u32,
-    pub quantidade_total_de_itens: u64,
+    /// C6 may omit this count for received Pix, including nonempty pages.
+    /// `None` means unknown, not zero; paginate using `quantidade_de_paginas`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantidade_total_de_itens: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -339,9 +339,13 @@ impl Client {
         .await
     }
     /// Fetches one page. Increment `pagina_atual` only after durably processing it.
+    /// Bounds are converted to UTC and fractional seconds are truncated. Persist
+    /// polling checkpoints at whole-second precision to match the queried window.
+    /// Invalid or reversed RFC3339 bounds fail before authentication or network IO.
     pub async fn list_pix(&self, query: &PixQuery) -> Result<PixPage, Error> {
+        let query = query.normalized()?;
         Self::decode(
-            self.request::<Value>(Method::GET, "pix", None, None, Some(query))
+            self.request::<Value>(Method::GET, "pix", None, None, Some(&query))
                 .await?,
             false,
         )

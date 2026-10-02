@@ -20,6 +20,7 @@ struct Bank {
     auth_fail: Arc<Mutex<bool>>,
     malformed: Arc<Mutex<bool>>,
     delay: Arc<Mutex<bool>>,
+    pix_page: Arc<Mutex<Option<Value>>>,
 }
 async fn handler(State(bank): State<Bank>, req: Request) -> Response {
     let method = req.method().to_string();
@@ -70,7 +71,7 @@ async fn handler(State(bank): State<Bank>, req: Request) -> Response {
             .unwrap();
     }
     let result = if uri.starts_with("/v2/pix/pix?") {
-        json!({"pix":[],"parametros":{"paginacao":{"paginaAtual":2,"itensPorPagina":50,"quantidadeDePaginas":3,"quantidadeTotalDeItens":101}}})
+        bank.pix_page.lock().unwrap().clone().unwrap_or_else(|| json!({"pix":[],"parametros":{"paginacao":{"paginaAtual":2,"itensPorPagina":50,"quantidadeDePaginas":3,"quantidadeTotalDeItens":101}}}))
     } else if uri.starts_with("/v2/pix/pix/") {
         json!({"endToEndId":"receipt","valor":"12.01","horario":"2026-01-01T00:00:00Z"})
     } else if uri.starts_with("/v2/pix/webhook/") {
@@ -106,6 +107,135 @@ async fn setup() -> (Client, Bank) {
     (client, bank)
 }
 const TXID: &str = "12345678901234567890123456789012";
+
+#[tokio::test]
+async fn received_pix_pages_accept_an_unknown_total_without_fabricating_zero() {
+    let (client, bank) = setup().await;
+    // The empty fixture is the response shape observed in C6 production.
+    for receipts in [
+        json!([]),
+        json!([{
+            "endToEndId":"E12345678202610021100001234567890", "txid":TXID,
+            "valor":"1.00", "horario":"2026-10-02T11:00:00Z"
+        }]),
+    ] {
+        let expected = receipts.as_array().unwrap().len();
+        *bank.pix_page.lock().unwrap() = Some(json!({
+            "parametros": {
+                "inicio":"2026-10-01T11:22:56.000Z", "fim":"2026-10-02T11:22:56.000Z",
+                "paginacao":{"paginaAtual":0,"itensPorPagina":1,"quantidadeDePaginas":expected}
+            }, "pix":receipts
+        }));
+        let page = client
+            .list_pix(&PixQuery {
+                inicio: "2026-10-01T11:22:56Z".into(),
+                fim: "2026-10-02T11:22:56Z".into(),
+                itens_por_pagina: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("C6 can omit the total for empty or populated receipt pages");
+        assert_eq!(page.pix.len(), expected);
+        let serialized = serde_json::to_value(&page).unwrap();
+        assert!(
+            serialized["parametros"]["paginacao"]
+                .get("quantidadeTotalDeItens")
+                .is_none(),
+            "an omitted total must not become a false zero"
+        );
+    }
+}
+
+#[tokio::test]
+async fn receipt_queries_send_whole_seconds_in_utc() {
+    let (client, bank) = setup().await;
+    for (inicio, fim, expected_start, expected_end) in [
+        (
+            "2026-10-01T08:22:56.123456789-03:00",
+            "2026-10-02T11:22:56.999Z",
+            "2026-10-01T11:22:56Z",
+            "2026-10-02T11:22:56Z",
+        ),
+        (
+            "2026-10-01T00:00:00+00:00",
+            "2026-10-01T00:01:00Z",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:01:00Z",
+        ),
+        (
+            "2026-10-01T00:00:00.001+03:00",
+            "2026-10-01T01:00:00.000+03:00",
+            "2026-09-30T21:00:00Z",
+            "2026-09-30T22:00:00Z",
+        ),
+    ] {
+        client
+            .list_pix(&PixQuery {
+                inicio: inicio.into(),
+                fim: fim.into(),
+                txid: Some(TXID.into()),
+                pagina_atual: 2,
+                itens_por_pagina: 50,
+            })
+            .await
+            .unwrap();
+        let requests = bank.requests.lock().unwrap();
+        let path = &requests.last().unwrap().1;
+        let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+        let query: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["inicio"], expected_start);
+        assert_eq!(query["fim"], expected_end);
+        assert_eq!(query["txid"], TXID);
+        assert_eq!(query["paginacao.paginaAtual"], "2");
+        assert_eq!(query["paginacao.itensPorPagina"], "50");
+    }
+}
+
+#[tokio::test]
+async fn invalid_receipt_windows_fail_before_authentication() {
+    let (client, bank) = setup().await;
+    for (inicio, fim) in [
+        ("private-invalid-date", "2026-10-02T00:00:00Z"),
+        ("2026-10-01T00:00:00Z", ""),
+        ("2026-10-03T00:00:00Z", "2026-10-02T00:00:00Z"),
+    ] {
+        let error = client
+            .list_pix(&PixQuery {
+                inicio: inicio.into(),
+                fim: fim.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, c6_bank::Error::Configuration);
+        assert!(!format!("{error:?}").contains("private-invalid-date"));
+    }
+    assert!(bank.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pagination_keeps_reported_totals_and_rejects_malformed_metadata() {
+    for count in [0, 101, u64::MAX] {
+        let value = json!({"paginaAtual":0,"itensPorPagina":100,"quantidadeDePaginas":1,"quantidadeTotalDeItens":count});
+        let page: c6_bank::Pagination = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(page).unwrap()["quantidadeTotalDeItens"],
+            count
+        );
+    }
+    let base = json!({"paginaAtual":0,"itensPorPagina":100,"quantidadeDePaginas":1,"quantidadeTotalDeItens":1});
+    for field in ["paginaAtual", "itensPorPagina", "quantidadeDePaginas"] {
+        let mut value = base.clone();
+        value.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<c6_bank::Pagination>(value).is_err());
+    }
+    for invalid in [json!(-1), json!("1"), json!(1.5)] {
+        let mut value = base.clone();
+        value["quantidadeTotalDeItens"] = invalid;
+        assert!(serde_json::from_value::<c6_bank::Pagination>(value).is_err());
+    }
+}
+
 #[tokio::test]
 async fn shared_singleflight_token_and_expiry() {
     let (client, bank) = setup().await;
@@ -163,7 +293,7 @@ async fn sends_due_charge_patch_cancel_receipts_and_webhooks() {
             .paginacao
             .unwrap()
             .quantidade_total_de_itens,
-        101
+        Some(101)
     );
     client
         .put_webhook("key+@/x", "https://example.com/pix")

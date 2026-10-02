@@ -4,7 +4,7 @@ Async Rust SDK for C6 Bank Pix. Supports due-date charges (`cobv`), received Pix
 
 ```toml
 [dependencies]
-c6-bank = "0.1.0"
+c6-bank = "0.3.0"
 ```
 
 ```rust,no_run
@@ -62,6 +62,25 @@ Errors deliberately omit server bodies, URLs, credentials and raw transport deta
 - `put_webhook`, `get_webhook`, `delete_webhook`: `/v2/pix/webhook/{chave}`. This is the Pix webhook API, distinct from C6's generic `/v1/webhooks` service.
 
 The SDK does not create transaction IDs, automatically retry mutations, initiate refunds or apply business-specific settlement rules. A received webhook is a hint: fetch the receipt and charge from C6 and verify their identity, receiving key and amounts before recording payment. Preserve receipt value components and refund metadata for reconciliation.
+
+### Receipt queries and migration from 0.2
+
+C6 accepts whole-second receipt query bounds. `list_pix` parses RFC3339 bounds,
+converts offsets to UTC and truncates fractional seconds on both bounds before
+sending them. Invalid dates or a start later than the end return `Configuration`
+without an OAuth or API request. Receipt timestamps in responses retain their
+original precision.
+
+Persist the same whole-second bounds in polling checkpoints. Truncating the start
+can include receipts from earlier in that second; truncating the end defers the
+rest of that second to the next window. Overlap adjacent windows and deduplicate
+by `endToEndId` to account for boundary receipts and delayed visibility.
+
+In 0.3, `Pagination::quantidade_total_de_itens` is `Option<u64>`. C6 omits this
+field from some received-Pix pages. `None` means the count is unknown; do not
+treat it as an empty result. Use `quantidade_de_paginas` to decide when to stop,
+and retain count consistency checks when a count is supplied. Other pagination
+fields and authoritative receipt identity fields remain required.
 
 ## Sandbox and manual webhook setup
 

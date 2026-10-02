@@ -1,6 +1,6 @@
 [package]
 name = "c6-bank"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Async C6 Bank Pix SDK with mutual TLS and shared OAuth authentication"
@@ -10,6 +10,7 @@ keywords = ["c6", "pix", "payments", "sdk"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
