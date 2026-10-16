@@ -4,7 +4,7 @@ Async Rust SDK for C6 Bank Pix. Supports due-date charges (`cobv`), received Pix
 
 ```toml
 [dependencies]
-c6-bank = "0.3.0"
+c6-bank = "0.3.1"
 ```
 
 ```rust,no_run
