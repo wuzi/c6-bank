@@ -4,7 +4,7 @@ Async Rust SDK for C6 Bank Pix. Supports due-date charges (`cobv`), received Pix
 
 ```toml
 [dependencies]
-c6-bank = "0.3.1"
+c6-bank = "0.3.2"
 ```
 
 ```rust,no_run
@@ -51,9 +51,13 @@ Supply CNPJ instead of CPF for a legal entity. C6's inline PUT example lists CPF
 
 `Client` is cloneable. Clones share the connection pool and an expiry-aware OAuth token cache. Concurrent refresh requests use one authentication call. Authentication posts `grant_type=client_credentials`, `client_id` and `client_secret` as a form to `/v1/auth/`.
 
-`Environment::Production` explicitly selects production. `base_url`, `auth_url`, `timeout`, `add_root_certificate_pem` and `http_client` support controlled environments and testing. The default transport requires a PEM certificate chain and unencrypted PEM private key, checks server certificates, disables redirects and automatic retries, and has a 30-second timeout. An injected HTTP client replaces these transport settings: the caller must configure its mTLS identity, timeout, redirect policy and retry policy. Never use insecure certificate validation in production.
+`Environment::Production` explicitly selects production. `base_url`, `auth_url`, `timeout`, `operation_timeout`, `add_root_certificate_pem` and `http_client` support controlled environments and testing. The default transport requires a PEM certificate chain and unencrypted PEM private key, checks server certificates, disables redirects and automatic retries, and has a 30-second HTTP-attempt timeout (`timeout`). An injected HTTP client replaces these transport settings: the caller must configure its mTLS identity, timeout, redirect policy and retry policy. Never use insecure certificate validation in production.
 
-Errors deliberately omit server bodies, URLs, credentials and raw transport details. `status()` exposes the HTTP status, `retry_after()` retains the native `Retry-After` value, and `is_not_found()` identifies 404. `is_indeterminate()` flags mutation transport errors, HTTP 408/5xx and invalid success responses. Reconcile through GET using the original transaction ID. A 401 clears the shared token for the next explicit request without replaying the failed operation. Authentication failures occur before the mutation is sent.
+Every logical operation also has one 60-second deadline (`operation_timeout`) covering the token-cache lock wait, OAuth, resource dispatch and required JSON decoding. This SDK deadline applies to both default and injected transports; it does not reconfigure an injected client's own policies. The budget does not restart between phases or body chunks. Zero or unrepresentable operation durations return `Configuration`; invalid attempt durations are rejected when building the default transport. Cancelling an operation drops its owned work and releases token locks, without background replay.
+
+Success JSON accumulation is bounded to 64 KiB for OAuth and 10 MiB for resource responses. These are SDK retention ceilings, not published bank response maxima. Declared oversize responses fail before body consumption, and streamed bodies are checked before buffer growth; a complete bounded body is required for JSON decoding. OAuth body/read/decode failures retain the received status and `Retry-After` in `Authentication`. Resource failures use `Decode`, indeterminate only for mutations. Non-success bodies are not collected, and status-only success operations do not require JSON decoding.
+
+Errors deliberately omit server bodies, URLs, credentials and raw transport details. `status()` exposes the HTTP status, `retry_after()` retains the native `Retry-After` value, and `is_not_found()` identifies 404. `is_indeterminate()` flags mutation transport errors, HTTP 408/5xx and invalid success responses. Reconcile through GET using the original transaction ID. A 401 conditionally clears the rejected cached token without replaying the failed operation or erasing a newer token. Waiting for concurrent refresh is bounded by the original deadline; a received 401 and its `Retry-After` remain authoritative if that wait expires. Authentication expiration before resource dispatch is definitive; expiration after a mutation may have been dispatched is indeterminate. Authentication failures occur before the mutation is sent.
 
 ## Operations
 
