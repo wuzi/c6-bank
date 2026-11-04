@@ -3,7 +3,10 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{fmt, sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::Mutex,
+    time::{Instant, timeout_at},
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Environment {
@@ -29,8 +32,15 @@ struct Inner {
     auth_url: Url,
     client_id: String,
     client_secret: String,
-    token: Mutex<Option<Token>>,
+    token: Mutex<Option<Arc<Token>>>,
+    operation_timeout: Duration,
 }
+struct ResponseContext {
+    response: reqwest::Response,
+    deadline: Instant,
+    mutation: bool,
+}
+
 struct Token {
     value: String,
     expires_at: Instant,
@@ -46,6 +56,7 @@ pub struct ClientBuilder {
     root_certificates: Vec<reqwest::Certificate>,
     http: Option<reqwest::Client>,
     timeout: Duration,
+    operation_timeout: Duration,
 }
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,6 +79,7 @@ impl ClientBuilder {
             root_certificates: vec![],
             http: None,
             timeout: Duration::from_secs(30),
+            operation_timeout: Duration::from_secs(60),
         }
     }
     pub fn environment(mut self, environment: Environment) -> Self {
@@ -104,17 +116,27 @@ impl ClientBuilder {
         self.http = Some(http);
         self
     }
+    /// HTTP-attempt timeout for the SDK-built transport (default 30 seconds).
+    /// An injected HTTP client retains its own transport policy.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
+    /// Complete operation budget, including token-lock wait, OAuth and response
+    /// decoding (default 60 seconds). Applies to injected HTTP clients too.
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.operation_timeout = timeout;
+        self
+    }
     pub fn build(self) -> Result<Client, Error> {
+        validate_timeout(self.operation_timeout)?;
         if self.client_id.is_empty() || self.client_secret.is_empty() {
             return Err(Error::Configuration);
         }
         let http = match self.http {
             Some(http) => http,
             None => {
+                validate_timeout(self.timeout)?;
                 let mut builder = reqwest::Client::builder()
                     .tls_backend_rustls()
                     .identity(self.identity.ok_or(Error::Configuration)?)
@@ -138,9 +160,17 @@ impl ClientBuilder {
             client_id: self.client_id,
             client_secret: self.client_secret,
             token: Mutex::new(None),
+            operation_timeout: self.operation_timeout,
         })))
     }
 }
+fn validate_timeout(timeout: Duration) -> Result<(), Error> {
+    if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
+        return Err(Error::Configuration);
+    }
+    Ok(())
+}
+
 fn parse_url(value: &str) -> Result<Url, Error> {
     let url = Url::parse(value).map_err(|_| Error::Configuration)?;
     if !matches!(url.scheme(), "http" | "https")
@@ -184,13 +214,22 @@ impl Client {
     ) -> ClientBuilder {
         ClientBuilder::new(client_id, client_secret)
     }
-    async fn token(&self) -> Result<String, Error> {
-        let mut cache = self.0.token.lock().await;
+    async fn token(&self, deadline: Instant) -> Result<Arc<Token>, Error> {
+        let unavailable = || Error::Authentication {
+            status: None,
+            retry_after: None,
+        };
+        let mut cache = timeout_at(deadline, self.0.token.lock())
+            .await
+            .map_err(|_| unavailable())?;
+        if Instant::now() >= deadline {
+            return Err(unavailable());
+        }
         if let Some(token) = cache
             .as_ref()
             .filter(|token| token.expires_at > Instant::now())
         {
-            return Ok(token.value.clone());
+            return Ok(token.clone());
         }
         #[derive(Deserialize)]
         struct Response {
@@ -198,52 +237,45 @@ impl Client {
             expires_in: u64,
         }
         let started = Instant::now();
-        let response = self
-            .0
-            .http
-            .post(self.0.auth_url.clone())
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", self.0.client_id.as_str()),
-                ("client_secret", self.0.client_secret.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|_| Error::Authentication {
-                status: None,
-                retry_after: None,
-            })?;
+        let response = timeout_at(
+            deadline,
+            self.0
+                .http
+                .post(self.0.auth_url.clone())
+                .form(&[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", self.0.client_id.as_str()),
+                    ("client_secret", self.0.client_secret.as_str()),
+                ])
+                .send(),
+        )
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
+        let authentication = Error::Authentication {
+            status: Some(response.status().as_u16()),
+            retry_after: retry_after(&response),
+        };
         if !response.status().is_success() {
-            return Err(Error::Authentication {
-                status: Some(response.status().as_u16()),
-                retry_after: retry_after(&response),
-            });
+            return Err(authentication);
         }
-        let response: Response = response.json().await.map_err(|_| Error::Authentication {
-            status: None,
-            retry_after: None,
-        })?;
+        let response: Response = read_json(response, 65_536, deadline)
+            .await
+            .map_err(|_| authentication.clone())?;
         if response.access_token.is_empty() {
-            return Err(Error::Authentication {
-                status: None,
-                retry_after: None,
-            });
+            return Err(authentication);
         }
         let ttl = Duration::from_secs(response.expires_in);
         let margin = (ttl / 10).min(Duration::from_secs(30));
-        let expires_at =
-            started
-                .checked_add(ttl.saturating_sub(margin))
-                .ok_or(Error::Authentication {
-                    status: None,
-                    retry_after: None,
-                })?;
-        let value = response.access_token;
-        *cache = Some(Token {
-            value: value.clone(),
+        let expires_at = started
+            .checked_add(ttl.saturating_sub(margin))
+            .ok_or(authentication)?;
+        let token = Arc::new(Token {
+            value: response.access_token,
             expires_at,
         });
-        Ok(value)
+        *cache = Some(token.clone());
+        Ok(token)
     }
     async fn request<B: Serialize + ?Sized>(
         &self,
@@ -252,7 +284,7 @@ impl Client {
         id: Option<&str>,
         body: Option<&B>,
         query: Option<&PixQuery>,
-    ) -> Result<reqwest::Response, Error> {
+    ) -> Result<ResponseContext, Error> {
         let mutation = method != Method::GET;
         let mut parts = vec!["v2", "pix", resource];
         if let Some(id) = id {
@@ -262,22 +294,43 @@ impl Client {
             parts.push(id);
         }
         let url = endpoint(&self.0.base_url, &parts)?;
-        let token = self.token().await?;
-        let mut request = self.0.http.request(method, url).bearer_auth(&token);
+        let deadline = Instant::now()
+            .checked_add(self.0.operation_timeout)
+            .ok_or(Error::Configuration)?;
+        let token = self.token(deadline).await?;
+        let mut request = self.0.http.request(method, url).bearer_auth(&token.value);
         if let Some(body) = body {
             request = request.json(body);
         }
         if let Some(query) = query {
             request = request.query(query);
         }
-        let response = request.send().await.map_err(|e| Error::Transport {
-            indeterminate: mutation && !e.is_builder(),
-        })?;
+        if Instant::now() >= deadline {
+            return Err(Error::Authentication {
+                status: None,
+                retry_after: None,
+            });
+        }
+        let response = timeout_at(deadline, request.send())
+            .await
+            .map_err(|_| Error::Transport {
+                indeterminate: mutation,
+            })?
+            .map_err(|e| Error::Transport {
+                indeterminate: mutation && !e.is_builder(),
+            })?;
         let status = response.status();
         if status.as_u16() == 401 {
-            let mut cache = self.0.token.lock().await;
-            if cache.as_ref().is_some_and(|cached| cached.value == token) {
-                *cache = None;
+            // Keep the received 401 even if a concurrent refresh holds the lock
+            // until this operation expires. Identity distinguishes a fresh token
+            // even when the provider reuses the same access-token text.
+            if let Ok(mut cache) = timeout_at(deadline, self.0.token.lock()).await {
+                let rejected = cache
+                    .as_ref()
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &token));
+                if rejected {
+                    *cache = None;
+                }
             }
         }
         if !status.is_success() {
@@ -287,15 +340,23 @@ impl Client {
                 indeterminate: mutation && (status.is_server_error() || status.as_u16() == 408),
             });
         }
-        Ok(response)
-    }
-    async fn decode<T: DeserializeOwned>(
-        response: reqwest::Response,
-        mutation: bool,
-    ) -> Result<T, Error> {
-        response.json().await.map_err(|_| Error::Decode {
-            indeterminate: mutation,
+        if Instant::now() >= deadline {
+            return Err(Error::Transport {
+                indeterminate: mutation,
+            });
+        }
+        Ok(ResponseContext {
+            response,
+            deadline,
+            mutation,
         })
+    }
+    async fn decode<T: DeserializeOwned>(context: ResponseContext) -> Result<T, Error> {
+        read_json(context.response, 10_485_760, context.deadline)
+            .await
+            .map_err(|_| Error::Decode {
+                indeterminate: context.mutation,
+            })
     }
     /// Creates/replaces the caller's immutable transaction ID; no automatic replay.
     pub async fn put_due_charge(
@@ -306,7 +367,6 @@ impl Client {
         Self::decode(
             self.request(Method::PUT, "cobv", Some(txid), Some(charge), None)
                 .await?,
-            true,
         )
         .await
     }
@@ -314,7 +374,6 @@ impl Client {
         Self::decode(
             self.request::<Value>(Method::GET, "cobv", Some(txid), None, None)
                 .await?,
-            false,
         )
         .await
     }
@@ -322,7 +381,6 @@ impl Client {
         Self::decode(
             self.request(Method::PATCH, "cobv", Some(txid), Some(patch), None)
                 .await?,
-            true,
         )
         .await
     }
@@ -334,7 +392,6 @@ impl Client {
         Self::decode(
             self.request::<Value>(Method::GET, "pix", Some(e2eid), None, None)
                 .await?,
-            false,
         )
         .await
     }
@@ -347,7 +404,6 @@ impl Client {
         Self::decode(
             self.request::<Value>(Method::GET, "pix", None, None, Some(&query))
                 .await?,
-            false,
         )
         .await
     }
@@ -366,7 +422,6 @@ impl Client {
         Self::decode(
             self.request::<Value>(Method::GET, "webhook", Some(key), None, None)
                 .await?,
-            false,
         )
         .await
     }
@@ -374,5 +429,89 @@ impl Client {
         self.request::<Value>(Method::DELETE, "webhook", Some(key), None, None)
             .await?;
         Ok(())
+    }
+}
+
+/// The limits bound the SDK's retained JSON bytes, not provider response maxima.
+async fn read_json<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+    deadline: Instant,
+) -> Result<T, ()> {
+    timeout_at(deadline, async {
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
+        {
+            return Err(());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+            if Instant::now() >= deadline {
+                return Err(());
+            }
+            let length = body
+                .len()
+                .checked_add(chunk.len())
+                .filter(|size| *size <= limit)
+                .ok_or(())?;
+            if length > body.capacity() {
+                let capacity = body.capacity().saturating_mul(2).max(length).min(limit);
+                body.try_reserve_exact(capacity - body.len())
+                    .map_err(|_| ())?;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        // Parsing is synchronous and bounded by the retained bytes. Check on
+        // both sides so even an immediately-ready future cannot succeed late.
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        let decoded = serde_json::from_slice(&body).map_err(|_| ())?;
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        Ok(decoded)
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lock_wait_expiry_is_authentication_and_releases_cancelled_waiter() {
+        let client = Client::builder("id", "secret")
+            .http_client(reqwest::Client::new())
+            .base_url("http://127.0.0.1:1")
+            .unwrap()
+            .operation_timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let mut held = client.0.token.lock().await;
+        let error = client.cancel_due_charge("charge").await.unwrap_err();
+        assert_eq!(
+            error,
+            Error::Authentication {
+                status: None,
+                retry_after: None
+            }
+        );
+        *held = Some(Arc::new(Token {
+            value: "synthetic-token".into(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        }));
+        drop(held);
+        // A timed-out lock waiter cannot retain ownership or block later calls.
+        assert_eq!(
+            client
+                .token(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap()
+                .value,
+            "synthetic-token"
+        );
     }
 }
